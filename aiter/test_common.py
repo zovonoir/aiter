@@ -3,7 +3,7 @@
 import copy
 import multiprocessing as mp
 import os
-from functools import wraps
+from functools import lru_cache, wraps
 
 import numpy as np
 import pandas as pd
@@ -46,6 +46,55 @@ def ensure_spawn_method():
         pass
 
 
+@lru_cache(maxsize=None)
+def kineto_available():
+    try:
+        return bool(torch.autograd.kineto_available())
+    except Exception:
+        return True
+
+
+def cuda_event_timing_enabled():
+    # torch.profiler records no device events without Kineto, nor for kernels
+    # launched outside HIP's runtime API (e.g. FlyDSL) on some ROCm builds.
+    env = os.environ.get("AITER_PERF_USE_CUDA_EVENT")
+    if env is not None:
+        return env == "1"
+    return not kineto_available()
+
+
+def time_with_cuda_event(func, rotate_args, num_iters):
+    """Average device time per call, timed over one span of num_iters calls.
+
+    Replays a captured graph so host launch overhead is excluded, matching
+    what the profiler path measures; falls back to back-to-back eager launches
+    if the function cannot be captured.
+    """
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    graph = None
+    if os.environ.get("AITER_PERF_CUDA_EVENT_GRAPH", "1") == "1":
+        try:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run_iters_rotate(num_iters, func, rotate_args)
+            graph.replay()
+            torch.cuda.synchronize()
+        except Exception as e:
+            logger.info(f"cuda.Event timing: graph capture failed ({e}), eager")
+            graph = None
+            torch.cuda.synchronize()
+    start_event.record()
+    if graph is not None:
+        graph.replay()
+    else:
+        run_iters_rotate(num_iters, func, rotate_args)
+    end_event.record()
+    end_event.synchronize()
+    del graph
+    return start_event.elapsed_time(end_event) * 1000 / num_iters
+
+
 def perftest(
     num_iters=101,
     num_warmup=2,
@@ -78,6 +127,13 @@ def perftest(
             ] + [(args, kwargs)]
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
+            if not use_cuda_event and cuda_event_timing_enabled():
+                avg = time_with_cuda_event(func, rotate_args, num_iters)
+                data = func(*args, **kwargs)
+                torch.cuda.synchronize()
+                if int(os.environ.get("AITER_LOG_MORE", "0")):
+                    logger.info(f"avg: {avg} us/iter from cuda.Event span")
+                return data, avg
             if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
                 latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
