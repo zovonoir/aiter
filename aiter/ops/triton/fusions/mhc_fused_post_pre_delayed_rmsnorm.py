@@ -36,6 +36,7 @@ def mhc_fused_post_pre_delayed_rmsnorm(
     *,
     residual_out: torch.Tensor | None = None,
     config: dict | None = None,
+    mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fused delayed mHC seam.
 
@@ -54,6 +55,10 @@ def mhc_fused_post_pre_delayed_rmsnorm(
         residual_out: optional (T, 4, H) bf16 buffer for the new residual.
         config: optional launch config dict; loaded from the per-arch tuned configs
             (``get_mhc_fused_post_pre_delayed_rmsnorm_config``) when ``None``.
+        mxfp8_out: optional (T, H) e4m3 and (T, H // 32) uint8 E8M0 buffers that
+            also receive ``layer_input`` MXFP8-quantized (one scale per 32 lanes,
+            amax at the top of the e4m3 range), so a consumer can skip its own
+            quantization.
 
     Returns:
         (residual_out, post_mix (T, 4, 1), comb_mix (T, 4, 4), layer_input (T, H) bf16,
@@ -146,6 +151,8 @@ def mhc_fused_post_pre_delayed_rmsnorm(
         comb_out,
         layer_input,
         norm_weight,
+        mxfp8_out[0] if mxfp8_out is not None else layer_input,
+        mxfp8_out[1] if mxfp8_out is not None else layer_input,
         rms_eps,
         hc_pre_eps,
         hc_sinkhorn_eps,
@@ -156,5 +163,6 @@ def mhc_fused_post_pre_delayed_rmsnorm(
         NUM_SINKHORN_ITERS=int(sinkhorn_repeat),
         BLOCK_C=config["BLOCK_C"],
         num_warps=config["reduce_num_warps"],
+        QUANT_OUT=mxfp8_out is not None,
     )
     return residual_out, post_out, comb_out, layer_input, next_pre
