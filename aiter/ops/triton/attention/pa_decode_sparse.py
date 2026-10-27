@@ -92,6 +92,7 @@ def pa_decode_sparse(
     inv_rope_positions: torch.Tensor | None = None,
     inv_rope_cos_sin_cache: torch.Tensor | None = None,
     out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+    extra_scrub_nan: bool = False,
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
@@ -122,6 +123,8 @@ def pa_decode_sparse(
             two-loop's second (top-k) cache + index set; must be None otherwise.
         inv_rope_positions/inv_rope_cos_sin_cache/out_mxfp8: gfx950 gluon only —
             the output epilogue (see _pa_decode_sparse_gfx950_gluon).
+        extra_scrub_nan: gfx950 gluon only — zero NaN values read from the
+            extra cache, for caches a KV connector filled.
 
     On gfx950 the DSv4 gluon driver handles this: a 3D ``unified_kv`` selects the
     packed fp8_dsv4_mla (584 B rows) / bf16 block cache (``extra_*`` = the
@@ -194,14 +197,15 @@ def pa_decode_sparse(
                 inv_rope_positions=inv_rope_positions,
                 inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
                 out_mxfp8=out_mxfp8,
+                extra_scrub_nan=extra_scrub_nan,
             )
 
     assert (
         extra_cache is None and extra_indices is None and extra_indptr is None
     ), "extra_cache/extra_indices/extra_indptr are gfx950 packed-only"
     assert (
-        inv_rope_positions is None and out_mxfp8 is None
-    ), "the output epilogue is gfx950 gluon-only"
+        inv_rope_positions is None and out_mxfp8 is None and not extra_scrub_nan
+    ), "the output epilogue and extra_scrub_nan are gfx950 gluon-only"
 
     quant_kv = kv_scales is not None
     if quant_kv:
@@ -547,6 +551,7 @@ def _pa_decode_sparse_gfx950_gluon(
     inv_rope_positions=None,
     inv_rope_cos_sin_cache=None,
     out_mxfp8=None,
+    extra_scrub_nan=False,
 ):
     """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from cache.ndim:
     3D [nb, block, 584] -> packed fp8_dsv4_mla (uint8: 448 NoPE fp8 e4m3 OCP +
@@ -895,6 +900,7 @@ def _pa_decode_sparse_gfx950_gluon(
         # Gather a tile ahead only for fp8_dsv4_mla's 32-head programs below prefill
         # size.
         DSV4_PREFETCH=packed_fp8 and BLOCK_M == 32 and not prefill,
+        EXTRA_SCRUB_NAN=bool(extra_scrub_nan) and extra_cache is not None,
         num_warps=num_warps,
         waves_per_eu=waves_per_eu,
         **prefill_kw,
