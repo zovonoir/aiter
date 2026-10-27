@@ -419,6 +419,7 @@ def _forward_paged(
     inv_rope_positions,
     inv_rope_cos_sin_cache,
     out_mxfp8,
+    extra_scrub_nan=False,
 ):
     """dsv4 and the SWA+top-k two-loop, until the two launchers merge."""
     from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
@@ -455,6 +456,7 @@ def _forward_paged(
         inv_rope_positions=inv_rope_positions,
         inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
         out_mxfp8=out_mxfp8,
+        extra_scrub_nan=extra_scrub_nan,
     )
     return res if isinstance(res, tuple) else (res, None)
 
@@ -718,6 +720,7 @@ def sparse_mla_fwd(
     inv_rope_positions: torch.Tensor | None = None,
     inv_rope_cos_sin_cache: torch.Tensor | None = None,
     out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+    extra_scrub_nan: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Sparse (top-k gathered) MLA attention.
 
@@ -813,6 +816,9 @@ def sparse_mla_fwd(
             MXFP8-quantized, one scale per 32 lanes, and data viewed as
             [C, H, D] is returned. It matches vLLM's inverse-RoPE + MXFP8
             pass on the bf16 rows up to rounding.
+        extra_scrub_nan: zero NaN values read from the extra (top-k) cache,
+            for caches a KV connector filled rather than the canonical writer.
+            DeepSeek-V4 two-loop caches only.
 
     Returns:
         (out, lse), out is
@@ -899,6 +905,11 @@ def sparse_mla_fwd(
             inv_rope_positions,
             inv_rope_cos_sin_cache,
             out_mxfp8,
+            extra_scrub_nan,
+        )
+    if extra_scrub_nan:
+        raise ValueError(
+            f"extra_scrub_nan needs a DeepSeek-V4 two-loop cache, got {fmt}"
         )
     arch = arch_info.get_arch()
     assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
