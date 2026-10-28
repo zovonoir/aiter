@@ -236,6 +236,8 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
     comb_out_ptr,  # (T, 4, 4) fp32
     layer_input_ptr,  # (T, H) bf16, rescaled in place
     norm_w_ptr,  # (H,) norm weight
+    q_ptr,  # (T, H) e4m3, QUANT_OUT only
+    q_scale_ptr,  # (T, H // 32) E8M0 bytes, QUANT_OUT only
     rms_eps,
     hc_pre_eps,
     hc_sinkhorn_eps,
@@ -245,6 +247,7 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
     NUM_KSPLIT: tl.constexpr,
     NUM_SINKHORN_ITERS: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    QUANT_OUT: tl.constexpr = False,
 ):
     """Grid (T,): one program per token."""
     tl.static_assert(H % BLOCK_C == 0, "the norm loop has no column mask")
@@ -308,4 +311,16 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
         xp = layer_input_ptr + t * H + rc
         xv = tl.load(xp).to(tl.float32)
         w = tl.load(norm_w_ptr + rc).to(tl.float32)
-        tl.store(xp, ((xv * rstd_n) * w).to(tl.bfloat16))
+        y = ((xv * rstd_n) * w).to(tl.bfloat16)
+        tl.store(xp, y)
+        if QUANT_OUT:
+            # MXFP8 of the bf16 output (one E8M0 per 32 lanes), bit-identical to
+            # quantizing the stored row: amax at the top of the e4m3 range.
+            blocks = tl.reshape(y.to(tl.float32), (BLOCK_C // 32, 32))
+            amax = tl.maximum(tl.max(tl.abs(blocks), axis=1), 1.1754943508222875e-38)
+            bits = tl.ceil(tl.log2(amax / 448.0)) + 127.0
+            bits = tl.minimum(tl.maximum(bits, 0.0), 254.0)
+            q = tl.reshape(blocks * tl.exp2(127.0 - bits)[:, None], (BLOCK_C,))
+            tl.store(q_ptr + t * H + rc, q.to(q_ptr.dtype.element_ty))
+            rg = c0 // 32 + tl.arange(0, BLOCK_C // 32)
+            tl.store(q_scale_ptr + t * (H // 32) + rg, bits.to(tl.uint8))
