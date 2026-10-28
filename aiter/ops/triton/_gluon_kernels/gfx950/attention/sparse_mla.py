@@ -585,6 +585,9 @@ class Fmt:
     TOK_U16: gl.constexpr  # the same row in bf16-view units
     ROPE_U16_OFF: gl.constexpr  # bf16-view offset of the rope tail in a row
     SCL_TRAILER_U8: gl.constexpr  # dsv4: scale bytes per token in the block trailer
+    # Zero NaN K/V values after dequant (caches not written by the canonical
+    # writer, e.g. loaded by a KV connector, may hold NaN code points).
+    SCRUB_NAN: gl.constexpr
     TOK_F32: gl.constexpr  # dsmla: f32-view stride per token row
     SCL_F32_OFF: gl.constexpr  # dsmla: f32-view offset of the group scales
     TOK_EL: gl.constexpr  # flat formats: cache elements per token row
@@ -600,7 +603,9 @@ class Fmt:
         NOPE_DIM,
         NOPE_CHUNK,
         CHUNK_AXIS,
+        SCRUB_NAN=False,
     ):
+        self.SCRUB_NAN = gl.constexpr(SCRUB_NAN)
         self.KIND = gl.constexpr(KIND)
         self.IS_FP8 = gl.constexpr(KIND != "bf16")
         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
@@ -722,6 +727,8 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
         val = _scaled_upcast_asm(
             x_u8.to(gl.int16, bitcast=True), s_even, W8, cfg.gather_l
         )
+        if fmt.SCRUB_NAN:
+            val = gl.where(val == val, val, gl.zeros_like(val))
         if AXIS == 1:
             kv_smem.slice(off, W8, dim=1).store(val)
         else:
@@ -742,6 +749,8 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
                 "fp8_dsv4_mla dequantizes with DEQ upcast or asm",
             )
             val = (_fp8_to_f32(x_u8) * sc).to(gl.bfloat16)
+        if fmt.SCRUB_NAN:
+            val = gl.where(val == val, val, gl.zeros_like(val))
         if AXIS == 1:
             kv_smem.slice(off, x_u8.shape[1], dim=1).store(val)
         else:
@@ -1203,6 +1212,8 @@ def _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem):
     else:
         _deq_store_tile(x_u8, sc, kv_smem, cfg, fmt)
         if fmt.KIND == "fp8_dsv4_mla":
+            if fmt.SCRUB_NAN:
+                k_rope = gl.where(k_rope == k_rope, k_rope, gl.zeros_like(k_rope))
             kv_smem.slice(fmt.NOPE_DIM, cfg.ROPE_DIM, dim=1).store(k_rope)
         elif fmt.KIND == "fp8_dsv32_mla":
             rope_smem.store(k_rope)
@@ -2270,6 +2281,8 @@ def _sparse_mla(
     os_stride0: gl.constexpr = 0,
     INV_ROPE: gl.constexpr = False,
     OUT_MXFP8: gl.constexpr = False,
+    # Zero NaN values gathered from the extra (top-k) cache; see Fmt.SCRUB_NAN.
+    EXTRA_SCRUB_NAN: gl.constexpr = False,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
     extra (top-k). Without SPLIT_K it writes the output directly; otherwise it
@@ -2417,6 +2430,7 @@ def _sparse_mla(
         NOPE_DIM,
         NOPE_CHUNK,
         CHUNK_AXIS,
+        EXTRA_SCRUB_NAN,
     )
 
     h_off = pid_h * BLOCK_M
